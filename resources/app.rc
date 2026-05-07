@@ -1,0 +1,5 @@
+#include <winuser.h>
+
+1 24 "resources/app.manifest"
+
+IDI_APP ICON "resources/app.ico"
