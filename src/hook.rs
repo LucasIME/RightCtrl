@@ -7,14 +7,11 @@ use std::thread::{self, JoinHandle};
 use once_cell::sync::OnceCell;
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, SendInput, INPUT, INPUT_0,
-    INPUT_KEYBOARD, KEYBDINPUT, VIRTUAL_KEY, VK_LWIN, VK_RWIN,
-};
+use windows::Win32::UI::Input::KeyboardAndMouse::VK_RCONTROL;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG,
     SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN,
-    WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_SYSKEYDOWN,
 };
 use windows::core::PCWSTR;
 
@@ -25,13 +22,13 @@ pub struct HookHandle {
 }
 
 impl HookHandle {
-    /// Release the hook and force-release RWin if it's being held (best effort).
+    /// Release the hook. We never swallow RCtrl itself, so there is no
+    /// stuck-modifier risk and nothing to synthesize on shutdown.
     pub fn shutdown(&self) {
         let h = self.hook.swap(0, Ordering::SeqCst);
         if h != 0 {
             unsafe {
                 let _ = UnhookWindowsHookEx(HHOOK(h as _));
-                synth_key(VK_RWIN, true); // release RWin
             }
         }
     }
@@ -66,8 +63,7 @@ thread_local! {
 struct HookCtx {
     queue: Arc<Mutex<std::collections::VecDeque<AppEvent>>>,
     wake: nwg::NoticeSender,
-    rwin_down: bool,
-    rwin_consumed: bool,
+    rctrl_down: bool,
 }
 
 fn hook_thread(
@@ -76,12 +72,7 @@ fn hook_thread(
     wake: nwg::NoticeSender,
 ) {
     CTX.with(|c| {
-        *c.borrow_mut() = Some(HookCtx {
-            queue,
-            wake,
-            rwin_down: false,
-            rwin_consumed: false,
-        });
+        *c.borrow_mut() = Some(HookCtx { queue, wake, rctrl_down: false });
     });
 
     let hmod = unsafe { GetModuleHandleW(PCWSTR::null()) }
@@ -134,7 +125,7 @@ unsafe extern "system" fn ll_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> 
 unsafe fn handle_event(wparam: WPARAM, lparam: LPARAM) -> bool {
     let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
 
-    // Ignore our own synthesized keystrokes.
+    // Ignore our own synthesized keystrokes (none today, but cheap to keep).
     if kb.flags.0 & LLKHF_INJECTED.0 != 0 {
         return false;
     }
@@ -142,50 +133,26 @@ unsafe fn handle_event(wparam: WPARAM, lparam: LPARAM) -> bool {
     let vk = kb.vkCode;
     let msg = wparam.0 as u32;
     let is_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
-    let is_up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
 
-    // Right Windows key
-    if vk == VK_RWIN.0 as u32 {
-        if is_down {
-            CTX.with(|c| {
-                if let Some(ctx) = c.borrow_mut().as_mut() {
-                    ctx.rwin_down = true;
-                }
-            });
-            return true;
-        }
-        if is_up {
-            let was_consumed = CTX.with(|c| {
-                let mut b = c.borrow_mut();
-                let ctx = match b.as_mut() {
-                    Some(x) => x,
-                    None => return false,
-                };
-                let was = ctx.rwin_consumed;
-                ctx.rwin_down = false;
-                ctx.rwin_consumed = false;
-                was
-            });
-            if !was_consumed {
-                // Plain RWin tap: synthesize a LWin tap so Start menu still opens.
-                unsafe {
-                    synth_key(VK_LWIN, false);
-                    synth_key(VK_LWIN, true);
-                }
+    // Right Ctrl — track state but never swallow; let Windows handle it
+    // normally so RCtrl+click / RCtrl-as-modifier in other apps still works.
+    if vk == VK_RCONTROL.0 as u32 {
+        CTX.with(|c| {
+            if let Some(ctx) = c.borrow_mut().as_mut() {
+                ctx.rctrl_down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
             }
-            return true;
-        }
+        });
         return false;
     }
 
-    // RWin + letter combo
+    // Letter key pressed while RCtrl is held → hotkey; swallow so the app
+    // doesn't receive a Ctrl+<letter> accelerator.
     if is_down {
-        let rwin_down = CTX.with(|c| c.borrow().as_ref().map(|x| x.rwin_down).unwrap_or(false));
-        if rwin_down {
+        let rctrl_down = CTX.with(|c| c.borrow().as_ref().map(|x| x.rctrl_down).unwrap_or(false));
+        if rctrl_down {
             if let Some(letter) = vk_to_letter(vk) {
                 CTX.with(|c| {
                     if let Some(ctx) = c.borrow_mut().as_mut() {
-                        ctx.rwin_consumed = true;
                         if let Ok(mut q) = ctx.queue.lock() {
                             q.push_back(AppEvent::HotkeyLetter(letter));
                         }
@@ -194,13 +161,6 @@ unsafe fn handle_event(wparam: WPARAM, lparam: LPARAM) -> bool {
                 });
                 return true;
             }
-            // Any other key used while RWin is held still counts as "consumed"
-            // so we don't accidentally open Start.
-            CTX.with(|c| {
-                if let Some(ctx) = c.borrow_mut().as_mut() {
-                    ctx.rwin_consumed = true;
-                }
-            });
         }
     }
 
@@ -216,30 +176,8 @@ fn vk_to_letter(vk: u32) -> Option<char> {
     }
 }
 
-unsafe fn synth_key(vk: VIRTUAL_KEY, key_up: bool) {
-    let mut flags = KEYEVENTF_EXTENDEDKEY;
-    if key_up {
-        flags |= KEYEVENTF_KEYUP;
-    }
-    let input = INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: vk,
-                wScan: 0,
-                dwFlags: KEYBD_EVENT_FLAGS(flags.0),
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    };
-    unsafe {
-        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
-    }
-}
-
-/// Install a panic hook that releases the keyboard hook and RWin on panic,
-/// to avoid leaving a stuck modifier.
+/// Install a panic hook that releases the keyboard hook on panic.
+/// No key synthesis is needed — we never swallow the RCtrl key itself.
 pub fn install_panic_guard() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
